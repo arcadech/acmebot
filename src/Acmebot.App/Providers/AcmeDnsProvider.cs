@@ -1,4 +1,4 @@
-﻿using System.Net.Http.Headers;
+﻿using System.Globalization;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 
@@ -11,11 +11,16 @@ public class AcmeDnsProvider : IDnsProvider
     private readonly AcmeDnsClient _acmeDnsClient;
     private readonly IReadOnlyDictionary<string, AcmeDnsZoneOptions> _zoneOptions;
 
-    public AcmeDnsProvider(AcmeDnsOptions options)
+    public AcmeDnsProvider(AcmeDnsOptions options) : this(options, null)
     {
-        _acmeDnsClient = new AcmeDnsClient(options.Endpoint);
+    }
 
-        var duplicateZoneNames = options.Zones.GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+    internal AcmeDnsProvider(AcmeDnsOptions options, HttpMessageHandler? handler)
+    {
+        var idnMapping = new IdnMapping();
+        var normalizedZones = options.Zones.Select(x => new { Name = idnMapping.GetAscii(x.Name), Options = x }).ToArray();
+
+        var duplicateZoneNames = normalizedZones.GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
                                               .Where(x => x.Count() > 1)
                                               .Select(x => x.Key)
                                               .ToArray();
@@ -25,7 +30,8 @@ public class AcmeDnsProvider : IDnsProvider
             throw new InvalidOperationException($"AcmeDns zone names must be unique. Duplicates: {string.Join(", ", duplicateZoneNames)}.");
         }
 
-        _zoneOptions = options.Zones.ToDictionary(x => x.Name, StringComparer.OrdinalIgnoreCase);
+        _zoneOptions = normalizedZones.ToDictionary(x => x.Name, x => x.Options, StringComparer.OrdinalIgnoreCase);
+        _acmeDnsClient = new AcmeDnsClient(options.Endpoint, handler);
         PropagationDelay = TimeSpan.FromSeconds(options.PropagationSeconds);
     }
 
@@ -53,7 +59,15 @@ public class AcmeDnsProvider : IDnsProvider
             throw new InvalidOperationException($"No acme-dns configuration was found for zone '{zone.Name}'.");
         }
 
-        foreach (var value in values.Distinct(StringComparer.Ordinal))
+        var distinctValues = values.Distinct(StringComparer.Ordinal).ToArray();
+
+        // acme-dns rotates two TXT records, allowing apex and wildcard challenges together.
+        if (distinctValues.Length > 2)
+        {
+            throw new InvalidOperationException($"acme-dns supports at most two distinct TXT values per delegated record. Zone '{zone.Name}' requires {distinctValues.Length}.");
+        }
+
+        foreach (var value in distinctValues)
         {
             await _acmeDnsClient.UpdateTxtRecordAsync(zoneOption, value, cancellationToken);
         }
@@ -67,14 +81,9 @@ public class AcmeDnsProvider : IDnsProvider
 
     private class AcmeDnsClient
     {
-        public AcmeDnsClient(string endpoint)
+        public AcmeDnsClient(string endpoint, HttpMessageHandler? handler)
         {
-            _httpClient = new HttpClient
-            {
-                BaseAddress = new Uri(AppendTrailingSlash(endpoint))
-            };
-
-            _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            _httpClient = DnsProviderHttpClient.Create(AppendTrailingSlash(endpoint), handler);
         }
 
         private readonly HttpClient _httpClient;
@@ -95,7 +104,7 @@ public class AcmeDnsProvider : IDnsProvider
             message.Headers.TryAddWithoutValidation("X-Api-User", zone.Username);
             message.Headers.TryAddWithoutValidation("X-Api-Key", zone.Password);
 
-            var response = await _httpClient.SendAsync(message, cancellationToken);
+            using var response = await _httpClient.SendAsync(message, cancellationToken);
 
             response.EnsureSuccessStatusCode();
         }
